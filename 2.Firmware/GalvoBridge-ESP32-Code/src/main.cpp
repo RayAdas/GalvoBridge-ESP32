@@ -1,69 +1,100 @@
 #include <Arduino.h>
+#include <atomic>
+#include <driver/gptimer.h>
 #include "DAC8562.h"
 #include "GalvoParser.h"
 #include "LaserCtrl.h"
 
-DAC8562 dac;
-hw_timer_t *timer = NULL;
+#if defined(GALVO_SCAN_DIAGNOSTIC)
+static DAC8562 dac(10000000);
+#else
+static DAC8562 dac;
+#endif
+static gptimer_handle_t timer;
+static TaskHandle_t scanTask;
+static constexpr UBaseType_t ScanPriority = 20;
+static constexpr uint32_t InitialPeriod = 400;
+static std::atomic<uint32_t> requestedPeriod{InitialPeriod};
+static std::atomic<uint32_t> programmedPeriod{InitialPeriod};
+static std::atomic<bool> timerUpdateFailed{false};
 
-void IRAM_ATTR onTimer()
+static bool ARDUINO_ISR_ATTR notifyScan(gptimer_handle_t handle,
+                                       const gptimer_alarm_event_data_t *, void *)
 {
-    static uint32_t current_point_idx = 0; // 当前播放到哪一个点
-
-    point_t *current_frame = NULL;
-    uint32_t total_points = 0;
-
-    // 从解析器模块直接抓取当前的“播放缓冲区”指针和点数
-    galvoParser_getRenderFrame(&current_frame, &total_points);
-
-    // 如果没有数据，或者数据点数为0，维持输出中心点
-    if (total_points == 0 || current_frame == NULL)
+    const uint32_t period = requestedPeriod.load(std::memory_order_relaxed);
+    if (period != programmedPeriod.load(std::memory_order_relaxed))
     {
-        dac.sync_outputs(32768, 32768);
-        current_point_idx = 0;
-        return;
+        gptimer_alarm_config_t alarm = {};
+        alarm.alarm_count = period;
+        alarm.flags.auto_reload_on_alarm = true;
+        if (gptimer_set_alarm_action(handle, &alarm) == ESP_OK)
+            programmedPeriod.store(period, std::memory_order_relaxed);
+        else
+            timerUpdateFailed.store(true, std::memory_order_relaxed);
     }
+    BaseType_t wake = pdFALSE;
+    vTaskNotifyGiveFromISR(scanTask, &wake);
+    return wake == pdTRUE;
+}
 
-    // 安全边界检查：如果串口突然切换了帧，并且新帧点数变少了，防止索引越界
-    if (current_point_idx >= total_points)
+static void scan(void *)
+{
+    uint32_t applied = InitialPeriod;
+    for (;;)
     {
-        current_point_idx = 0;
-    }
-
-    // 吐出当前点的 X, Y 坐标给 DAC 芯片
-    dac.sync_outputs(current_frame[current_point_idx].x, current_frame[current_point_idx].y);
-
-    // 递增索引，如果到了画面末尾，自动重头循环（振镜需要高频不断地重绘画面）
-    current_point_idx++;
-    if (current_point_idx >= total_points)
-    {
-        current_point_idx = 0;
+        const uint32_t ticks = ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        const uint32_t period = programmedPeriod.load(std::memory_order_relaxed);
+        if (applied != period)
+        {
+            applied = period;
+            galvoParser_setAppliedPeriod(applied);
+        }
+        requestedPeriod.store(galvoParser_scan(dac, timerUpdateFailed.load(std::memory_order_relaxed),
+                                               ticks - 1),
+                              std::memory_order_relaxed);
     }
 }
 
 void setup()
 {
+    laserCtrl_init();
+    if (Serial.setRxBufferSize(8192) != 8192)
+        return;
     Serial.begin(921600);
+    Serial.setTxTimeoutMs(5);
 
+    // Arduino-ESP32 starts the unpinned TinyUSB device task before setup().
+    // Let the timer wake the scan task even while CDC is receiving a packet.
+    if (TaskHandle_t usbTask = xTaskGetHandle("usbd"))
+    {
+        if (uxTaskPriorityGet(usbTask) >= ScanPriority)
+            vTaskPrioritySet(usbTask, ScanPriority - 1);
+    }
+    // Allow the analog rail to settle before sending the DAC's reset and reference commands.
+    delay(500);
     dac.begin();
     dac.sync_outputs(32768, 32768);
 
-    delay(1000);
-
-    // 1. 初始化解析器：这会在后台建立一个独立运行的串口扫描任务
+    gptimer_config_t config = {};
+    config.clk_src = GPTIMER_CLK_SRC_DEFAULT;
+    config.direction = GPTIMER_COUNT_UP;
+    config.resolution_hz = 10000000;
+    gptimer_event_callbacks_t callbacks = {};
+    callbacks.on_alarm = notifyScan;
+    gptimer_alarm_config_t alarm = {};
+    alarm.alarm_count = InitialPeriod;
+    alarm.flags.auto_reload_on_alarm = true;
+    if (gptimer_new_timer(&config, &timer) != ESP_OK ||
+        gptimer_register_event_callbacks(timer, &callbacks, nullptr) != ESP_OK ||
+        gptimer_set_alarm_action(timer, &alarm) != ESP_OK ||
+        gptimer_enable(timer) != ESP_OK ||
+        xTaskCreatePinnedToCore(scan, "GalvoScan", 4096, nullptr, ScanPriority, &scanTask, 1) != pdPASS ||
+        gptimer_start(timer) != ESP_OK)
+        return;
     galvoParser_init();
-
-    // 2. 启动硬件定时器
-    timer = timerBegin(0, 80, true);
-    timerAttachInterrupt(timer, &onTimer, true);
-    timerAlarmWrite(timer, 40, true);
-    timerAlarmEnable(timer);
-
-    Serial.println("Ready @ 921600 bps");
-
-    laserCtrl_init();
 }
 
 void loop()
 {
+    delay(1000);
 }

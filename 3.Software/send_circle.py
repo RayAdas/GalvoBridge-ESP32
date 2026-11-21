@@ -13,7 +13,7 @@ import time
 import serial
 
 # ====== 可配置参数 ======
-COM_PORT = "COM9"
+COM_PORT = "COM3"
 BAUDRATE = 921600
 POINT_COUNT = 400          # 点数量
 ORIGIN = 0x7FFF              # 原点 (32767)

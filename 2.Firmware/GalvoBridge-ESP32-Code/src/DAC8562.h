@@ -24,7 +24,6 @@ public:
     void sync_outputs(uint16_t ch_a_val, uint16_t ch_b_val);
 
 private:
-    uint32_t _freq;
     SPISettings _settings;
     void _transfer(uint8_t cmd, uint16_t data);
 };

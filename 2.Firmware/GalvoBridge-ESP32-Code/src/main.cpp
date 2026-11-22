@@ -13,7 +13,7 @@ static DAC8562 dac;
 static gptimer_handle_t timer;
 static TaskHandle_t scanTask;
 static constexpr UBaseType_t ScanPriority = 20;
-static constexpr uint32_t InitialPeriod = 400;
+using GalvoPlayback::InitialPeriod;
 static std::atomic<uint32_t> requestedPeriod{InitialPeriod};
 static std::atomic<uint32_t> programmedPeriod{InitialPeriod};
 static std::atomic<bool> timerUpdateFailed{false};
@@ -78,7 +78,7 @@ void setup()
     gptimer_config_t config = {};
     config.clk_src = GPTIMER_CLK_SRC_DEFAULT;
     config.direction = GPTIMER_COUNT_UP;
-    config.resolution_hz = 10000000;
+    config.resolution_hz = GalvoPlayback::TimerHz;
     gptimer_event_callbacks_t callbacks = {};
     callbacks.on_alarm = notifyScan;
     gptimer_alarm_config_t alarm = {};

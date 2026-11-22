@@ -8,22 +8,24 @@
 
 namespace
 {
-constexpr uint32_t Slots = 1000;
+using GalvoPlayback::BaseRate;
+using GalvoPlayback::TimerHz;
 constexpr uint32_t Capacity = 4000;
-constexpr uint32_t Target = 1300;
-constexpr uint32_t LeaseUs = 250000;
-constexpr uint32_t FrameTimeoutUs = 200000;
-constexpr uint32_t TimerHz = 10000000;
-constexpr size_t MaxBody = 4151;
-constexpr size_t MaxEncoded = 4168;
+constexpr uint32_t MaxTarget = 3000;
+static_assert(MaxTarget < Capacity, "Playback target must fit the queue");
+constexpr uint32_t MinRate = BaseRate - BaseRate / 50;
+constexpr uint32_t MaxRate = BaseRate + BaseRate / 50;
+constexpr uint8_t ProtocolVersion = 3;
+constexpr size_t MaxBody = 20 + UINT16_MAX;  // Header and CRC plus the full wire payload range.
+constexpr size_t MaxEncoded = MaxBody + MaxBody / 254 + 1;
 
-enum Message : uint8_t { Hello = 1, Points, SetLight, Keepalive, GetStatus,
+enum Message : uint8_t { Hello = 1, Points, GetStatus = 5,
                         HelloReply = 0x81, Ack, FrameStarted, Status, ScanStats };
-enum Result : uint8_t { Ok, BadRequest, Busy, RateUnsupported, Inhibited, Stale };
+enum Result : uint8_t { BadRequest = 1, RateUnsupported = 3, Stale = 5 };
 
 struct Sample
 {
-    uint32_t frame;
+    uint32_t frame;  // Nonzero on the first point of a packet, for reporting only.
     uint16_t x, y;
     bool blank;
 };
@@ -37,14 +39,13 @@ struct Started
 static portMUX_TYPE stateLock = portMUX_INITIALIZER_UNLOCKED;
 static QueueHandle_t starts;
 static Sample samples[Capacity];
-static Sample lastFrame[Slots];
 static uint32_t front, back, remaining, sampled, generation;
-static uint32_t cachedPoints, replayIndex;
-static bool replaying;
-static uint32_t baseRate = 25000, minRate = 24500, maxRate = 25500;
-static uint32_t requestedPeriod = 400, appliedPeriod = 400;
-static uint32_t lastRequest, accepted, active, underruns, permit;
-static uint64_t session, nonce, activeAt, receivedAt, leaseUntil, startAt, lastScan;
+static bool starved;
+static uint32_t requestedPeriod = GalvoPlayback::InitialPeriod;
+static uint32_t appliedPeriod = GalvoPlayback::InitialPeriod;
+static uint32_t lastRequest, accepted, active, underruns;
+static uint64_t session, nonce, activeAt, receivedAt, startAt, lastScan;
+static uint32_t targetPoints;
 enum ScanFault : uint16_t { WatchdogGap = 1 << 4, BeforeDacGap = 1 << 5,
                             DacUpdateGap = 1 << 6, TimerConfiguration = 1 << 7 };
 #if defined(GALVO_SCAN_DIAGNOSTIC)
@@ -57,10 +58,12 @@ static bool output, writingDac;
 struct ScanMetrics
 {
     uint32_t points, coalesced, maxDacUs, slowDac, maxGapUs, busy;
+    uint32_t enqueued, started, maxEnqueueGapUs, maxStartGapUs, minPostEnqueue;
+    uint32_t underrunEvents;
 };
 static ScanMetrics metrics;
 static uint64_t metricsSince;
-static uint8_t input[MaxEncoded], body[MaxBody];
+static uint8_t input[MaxEncoded];
 
 uint64_t nowUs() { return esp_timer_get_time(); }
 
@@ -105,18 +108,9 @@ void setOutput(bool enabled)
     }
 }
 
-void revoke()
+uint16_t scanFlags()
 {
-    permit = 0;
-    leaseUntil = 0;
-    setOutput(false);
-}
-
-uint16_t flags(uint64_t now)
-{
-    return (permit && now < leaseUntil ? 0 : 2) |
-           (active && now - receivedAt < FrameTimeoutUs ? 0 : 4) |
-           (scanFault ? 8 | scanFault : 0) | DiagnosticMode;
+    return (scanFault ? 8 | scanFault : 0) | DiagnosticMode;
 }
 
 bool scanBlocked()
@@ -124,30 +118,23 @@ bool scanBlocked()
     return !DiagnosticMode && scanFault;
 }
 
-void checkLight(uint64_t now)
-{
-    if (flags(now))
-        revoke();
-}
-
 uint32_t periodForRate(uint32_t rate)
 {
-    const uint32_t shortest = (TimerHz + maxRate - 1) / maxRate;
-    const uint32_t longest = TimerHz / minRate;
+    const uint32_t shortest = (TimerHz + MaxRate - 1) / MaxRate;
+    const uint32_t longest = TimerHz / MinRate;
     return constrain((TimerHz + rate / 2) / rate, shortest, longest);
 }
 
 void resetPlayback()
 {
-    revoke();
+    setOutput(false);
     front = back;
     remaining = 0;
     active = 0;
     activeAt = 0;
     startAt = 0;
-    cachedPoints = replayIndex = 0;
-    replaying = false;
-    requestedPeriod = periodForRate(baseRate);
+    starved = false;
+    requestedPeriod = GalvoPlayback::InitialPeriod;
     ++generation;
 }
 
@@ -166,7 +153,7 @@ void send(Message type, uint64_t id, uint32_t request, const uint8_t *payload, s
     uint8_t raw[96];
     uint8_t wire[99] = {};
     uint8_t *dst = raw;
-    appendNumber(dst, 2, 1);
+    appendNumber(dst, ProtocolVersion, 1);
     appendNumber(dst, type, 1);
     appendNumber(dst, id, 8);
     appendNumber(dst, request, 4);
@@ -194,9 +181,9 @@ void send(Message type, uint64_t id, uint32_t request, const uint8_t *payload, s
     Serial.write(wire, out - wire);
 }
 
-void report(Message type, uint32_t request, Result result = Ok, bool handshakeError = false)
+void report(Message type, uint32_t request, uint8_t result = 0, bool handshakeError = false)
 {
-    uint8_t data[48] = {};
+    uint8_t data[44] = {};
     uint8_t *dst = data;
     if (type == Ack)
         *dst++ = result;
@@ -213,79 +200,88 @@ void report(Message type, uint32_t request, Result result = Ok, bool handshakeEr
         appendNumber(dst, sampled, 4);
         appendNumber(dst, TimerHz / appliedPeriod, 4);
         appendNumber(dst, underruns, 4);
-        appendNumber(dst, permit, 4);
-        appendNumber(dst, flags(now), 2);
+        appendNumber(dst, scanFlags(), 2);
         appendNumber(dst, output, 1);
     }
     else
-        dst += 47;
+        dst += 43;
     portEXIT_CRITICAL(&stateLock);
     send(type, id, request, data, dst - data);
 }
 
 void reportScanMetrics()
 {
-    if (!DiagnosticMode)
-        return;
-    portENTER_CRITICAL(&stateLock);
+    uint8_t data[38];
     const uint64_t now = nowUs();
     const uint64_t elapsed = now - metricsSince;
     const uint64_t id = session;
     if (!id || elapsed < 1000000)
-    {
-        portEXIT_CRITICAL(&stateLock);
         return;
-    }
+    // Fit the whole wire packet into the 64-byte CDC TX FIFO without waiting for space.
+    if (Serial.availableForWrite() < int(sizeof(data) + 23))
+        return;
+
+    portENTER_CRITICAL(&stateLock);
     const ScanMetrics snapshot = metrics;
     const uint32_t configuredRate = TimerHz / appliedPeriod;
+    const uint32_t postEnqueue = sampled;
     metrics = {};
     metricsSince = now;
     portEXIT_CRITICAL(&stateLock);
-    uint8_t data[32];
     uint8_t *dst = data;
-    appendNumber(dst, elapsed, 4);
-    appendNumber(dst, snapshot.points, 4);
-    appendNumber(dst, configuredRate, 4);
-    appendNumber(dst, snapshot.coalesced, 4);
-    appendNumber(dst, snapshot.maxDacUs, 4);
-    appendNumber(dst, snapshot.slowDac, 4);
-    appendNumber(dst, snapshot.maxGapUs, 4);
-    appendNumber(dst, snapshot.busy, 4);
-    send(ScanStats, id, 0, data, sizeof(data));
+    const auto appendShort = [&dst](uint32_t value) {
+        appendNumber(dst, std::min<uint32_t>(value, UINT16_MAX), 2);
+    };
+    appendNumber(dst, std::min<uint64_t>(elapsed, UINT32_MAX), 4);
+    appendShort(snapshot.points);
+    appendShort(configuredRate);
+    appendShort(snapshot.coalesced);
+    appendShort(snapshot.maxDacUs);
+    appendShort(snapshot.slowDac);
+    appendShort(snapshot.maxGapUs);
+    appendShort(snapshot.busy);
+    appendShort(snapshot.enqueued);
+    appendShort(snapshot.started);
+    appendNumber(dst, snapshot.maxEnqueueGapUs, 4);
+    appendNumber(dst, snapshot.maxStartGapUs, 4);
+    appendShort(snapshot.minPostEnqueue);
+    appendShort(postEnqueue);
+    appendShort(0);  // Reserved former replay_points field.
+    appendShort(snapshot.underrunEvents);
+    send(ScanStats, id, 0, data, dst - data);
 }
 
 void hello(const uint8_t *data, size_t length, uint32_t request)
 {
-    if (length != 12 || request != 1 || !readNumber(data, 8))
+    if (length != 16 || request != 1 || !readNumber(data, 8))
     {
         report(Ack, request, BadRequest, true);
         return;
     }
     const uint64_t newNonce = readNumber(data, 8);
     const uint32_t rate = readNumber(data + 8, 4);
-    if (rate < 1000 || rate > 30000)
+    if (rate != BaseRate)
     {
         report(Ack, request, RateUnsupported, true);
         return;
     }
 
-    const uint64_t newSession = (uint64_t(esp_random()) << 32) | esp_random();
-    uint8_t reply[36];
-    uint8_t *dst = reply;
-    portENTER_CRITICAL(&stateLock);
-    if (session && nonce == newNonce && rate != baseRate)
+    const uint32_t target = readNumber(data + 12, 4);
+    if (target > MaxTarget || (session && nonce == newNonce && target != targetPoints))
     {
-        portEXIT_CRITICAL(&stateLock);
         report(Ack, request, BadRequest, true);
         return;
     }
+
+    const uint64_t newSession = (uint64_t(esp_random()) << 32) | esp_random();
+    uint8_t reply[24];
+    uint8_t *dst = reply;
+    portENTER_CRITICAL(&stateLock);
     if (!session || nonce != newNonce)
     {
         session = newSession ? newSession : 1;
         nonce = newNonce;
-        baseRate = rate;
-        minRate = baseRate - baseRate / 50;
-        maxRate = std::min<uint32_t>(30000, baseRate + baseRate / 50);
+        targetPoints = target;
         accepted = sampled = lastRequest = underruns = 0;
         scanFault = 0;
         metrics = {};
@@ -294,47 +290,40 @@ void hello(const uint8_t *data, size_t length, uint32_t request)
     }
     const uint64_t id = session;
     appendNumber(dst, nonce, 8);
-    appendNumber(dst, baseRate, 4);
-    appendNumber(dst, minRate, 4);
-    appendNumber(dst, maxRate, 4);
-    appendNumber(dst, Target, 4);
-    appendNumber(dst, Capacity, 4);
-    appendNumber(dst, LeaseUs, 4);
-    appendNumber(dst, FrameTimeoutUs, 4);
+    appendNumber(dst, BaseRate, 4);
+    appendNumber(dst, MinRate, 4);
+    appendNumber(dst, MaxRate, 4);
+    appendNumber(dst, MaxTarget, 4);
     portEXIT_CRITICAL(&stateLock);
     send(HelloReply, id, request, reply, dst - reply);
 }
 
-Result enqueue(const uint8_t *data, size_t length)
+void enqueue(const uint8_t *data, size_t length)
 {
     if (length < 6)
-        return BadRequest;
+        return;
     const uint32_t frame = readNumber(data, 4);
     const uint32_t count = readNumber(data + 4, 2);
-    if (!frame || !count || count > Slots || length != 6 + 4 * count + (count + 7) / 8)
-        return BadRequest;
+    if (!frame || !count || length != 6 + 4 * count + (count + 7) / 8)
+        return;
     const uint8_t *mask = data + 6 + count * 4;
-    if (!(mask[0] & 1) || (count % 8 && mask[count / 8] >> (count % 8)))
-        return BadRequest;
 
     portENTER_CRITICAL(&stateLock);
     const bool stale = frame <= accepted;
-    const bool busy = remaining > Capacity - Slots;
-    if (DiagnosticMode && busy && !stale)
-        ++metrics.busy;
+    const bool busy = count > Capacity - remaining;
     const bool fault = scanBlocked();
+    if (busy && !stale && !fault)
+        ++metrics.busy;
     const uint32_t offset = back;
     const uint32_t epoch = generation;
     portEXIT_CRITICAL(&stateLock);
     if (stale || busy || fault)
-        return stale ? Stale : (fault ? Inhibited : Busy);
+        return;
 
-    const uint32_t expanded = (Slots / count) * count;
-    for (uint32_t j = 0; j < Slots; ++j)
+    for (uint32_t i = 0; i < count; ++i)
     {
-        const uint32_t i = (j * expanded / Slots) % count;
-        Sample &point = samples[(offset + j) % Capacity];
-        point = {j ? 0 : frame, uint16_t(readNumber(data + 6 + i * 4, 2)),
+        Sample &point = samples[(offset + i) % Capacity];
+        point = {i ? 0 : frame, uint16_t(readNumber(data + 6 + i * 4, 2)),
                  uint16_t(readNumber(data + 8 + i * 4, 2)), bool(mask[i / 8] & (1 << (i % 8)))};
     }
 
@@ -342,35 +331,42 @@ Result enqueue(const uint8_t *data, size_t length)
     if (generation != epoch && scanBlocked())
     {
         portEXIT_CRITICAL(&stateLock);
-        return Inhibited;
+        return;
     }
     const uint64_t now = nowUs();
-    checkLight(now);
     if (!remaining && !active)
-        startAt = now + uint64_t(Target - Slots) * 1000000 / baseRate;
-    back = (back + Slots) % Capacity;
-    remaining += Slots;
+    {
+        const uint32_t headroom = targetPoints > count ? targetPoints - count : 0;
+        startAt = now + uint64_t(headroom) * 1000000 / BaseRate;
+    }
+    back = (back + count) % Capacity;
+    remaining += count;
     sampled = remaining;
+    if (!metrics.enqueued || sampled < metrics.minPostEnqueue)
+        metrics.minPostEnqueue = sampled;
+    ++metrics.enqueued;
+    if (accepted)
+        metrics.maxEnqueueGapUs = std::max(metrics.maxEnqueueGapUs,
+            uint32_t(std::min<uint64_t>(now - receivedAt, UINT32_MAX)));
     accepted = frame;
     receivedAt = now;
     if (active)
     {
         // Kp = 2 Hz/point. Limit the step to 0.5% of the baseline.
-        const int goal = constrain(int(baseRate) + 2 * (int(sampled) - int(Target)),
-                                   int(minRate), int(maxRate));
+        const int goal = constrain(int(BaseRate) + 2 * (int(sampled) - int(targetPoints)),
+                                   int(MinRate), int(MaxRate));
         const int current = TimerHz / appliedPeriod;
-        const int step = baseRate / 200;
+        const int step = BaseRate / 200;
         const int rate = constrain(constrain(goal, current - step, current + step),
-                                   int(minRate), int(maxRate));
+                                   int(MinRate), int(MaxRate));
         requestedPeriod = periodForRate(rate);
     }
     portEXIT_CRITICAL(&stateLock);
-    return Ok;
 }
 
-void handle(size_t length)
+void handle(const uint8_t *body, size_t length)
 {
-    if (length < 20 || body[0] != 2 ||
+    if (length < 20 || body[0] != ProtocolVersion ||
         readNumber(body + 14, 2) != length - 20 ||
         readNumber(body + length - 4, 4) != crc32(body, length - 4))
         return;
@@ -387,10 +383,10 @@ void handle(size_t length)
     if (!id || id != session || !request)
         return;
 
-    const bool off = type == SetLight && size == 1 && *data == 0;
-    if (request <= lastRequest && !off)
+    if (request <= lastRequest)
     {
-        report(Ack, request, Stale);
+        if (type != Points)
+            report(Ack, request, Stale);
         return;
     }
     lastRequest = max(lastRequest, request);
@@ -402,41 +398,10 @@ void handle(size_t length)
     }
     if (type == Points)
     {
-        report(Ack, request, enqueue(data, size));
+        enqueue(data, size);
         return;
     }
-    Result result = BadRequest;
-    portENTER_CRITICAL(&stateLock);
-    const uint64_t now = nowUs();
-    checkLight(now);
-    if (off)
-    {
-        revoke();
-        result = Ok;
-    }
-    else if (type == SetLight && size == 1 && *data == 1)
-    {
-        if (flags(now) == 2)
-        {
-            permit = request;
-            leaseUntil = now + LeaseUs;
-            result = Ok;
-        }
-        else
-            result = Inhibited;
-    }
-    else if (type == Keepalive && size == 4)
-    {
-        if (permit && permit == readNumber(data, 4))
-        {
-            leaseUntil = now + LeaseUs;
-            result = Ok;
-        }
-        else
-            result = Inhibited;
-    }
-    portEXIT_CRITICAL(&stateLock);
-    report(Ack, request, result);
+    report(Ack, request, BadRequest);
 }
 
 void decode(size_t size)
@@ -447,17 +412,18 @@ void decode(size_t size)
         const uint8_t code = input[pos++];
         if (!code || pos + code - 1 > size || written + code - 1 > MaxBody)
             return;
-        memcpy(body + written, input + pos, code - 1);
+        // Decoded bytes trail the read cursor, so one buffer suffices.
+        memmove(input + written, input + pos, code - 1);
         pos += code - 1;
         written += code - 1;
         if (code != 255 && pos < size)
         {
             if (written == MaxBody)
                 return;
-            body[written++] = 0;
+            input[written++] = 0;
         }
     }
-    handle(written);
+    handle(input, written);
 }
 
 void receive(void *)
@@ -466,6 +432,7 @@ void receive(void *)
     bool overflow = false;
     uint16_t previousFlags = 0xffff;
     uint32_t previousUnderruns = 0;
+    uint64_t previousSession = 0, lastStatusAt = 0;
     for (;;)
     {
         const bool connected = bool(Serial);
@@ -482,16 +449,19 @@ void receive(void *)
         {
             latchScanFault(writingDac ? DacUpdateGap : WatchdogGap);
         }
-        checkLight(now);
-        const uint16_t currentFlags = flags(now);
+        const uint16_t currentFlags = scanFlags();
         const uint32_t currentUnderruns = underruns;
         portEXIT_CRITICAL(&stateLock);
 
-        if (session && (currentFlags != previousFlags || currentUnderruns != previousUnderruns))
+        if (session && (session != previousSession || currentFlags != previousFlags
+                        || currentUnderruns != previousUnderruns || now - lastStatusAt >= 1000000))
+        {
             report(Status, 0);
+            lastStatusAt = now;
+        }
+        previousSession = session;
         previousFlags = currentFlags;
         previousUnderruns = currentUnderruns;
-        reportScanMetrics();
 
         Started event;
         while (xQueueReceive(starts, &event, 0) == pdTRUE)
@@ -522,6 +492,7 @@ void receive(void *)
             else
                 overflow = true;
         }
+        reportScanMetrics();
         vTaskDelay(1);
     }
 }
@@ -542,40 +513,31 @@ uint32_t galvoParser_scan(DAC8562 &dac, bool timerFault, uint32_t coalescedTicks
     uint64_t id;
     portENTER_CRITICAL(&stateLock);
     const uint64_t now = nowUs();
-    if (DiagnosticMode && active)
+    if (active)
         metrics.coalesced += coalescedTicks;
     if (timerFault)
         latchScanFault(TimerConfiguration);
     else if (active && now - lastScan > scanGapLimitUs())
         latchScanFault(BeforeDacGap);
-    if (active && !remaining && now - receivedAt >= FrameTimeoutUs)
-    {
-        resetPlayback();
-    }
     available = false;
     if (!scanBlocked() && remaining && now >= startAt)
     {
         point = samples[front];
         front = (front + 1) % Capacity;
         --remaining;
-        if (point.frame)
-            cachedPoints = 0;
-        lastFrame[cachedPoints] = {0, point.x, point.y, point.blank};
-        ++cachedPoints;
-        replaying = false;
+        starved = false;
         available = true;
     }
-    else if (!scanBlocked() && active && !remaining && cachedPoints == Slots)
+    else if (!scanBlocked() && active && !remaining)
     {
-        if (!replaying)
+        if (!starved)
         {
             ++underruns;
-            replayIndex = 0;
-            replaying = true;
+            ++metrics.underrunEvents;
+            starved = true;
+            setOutput(false);
         }
-        point = lastFrame[replayIndex];
-        replayIndex = (replayIndex + 1) % Slots;
-        available = true;
+        lastScan = now;  // The scan task is healthy even when the producer has no points.
     }
     if (available)
     {
@@ -583,7 +545,6 @@ uint32_t galvoParser_scan(DAC8562 &dac, bool timerFault, uint32_t coalescedTicks
         if (point.blank)
             setOutput(false);
     }
-    checkLight(now);
     epoch = generation;
     id = session;
     portEXIT_CRITICAL(&stateLock);
@@ -595,28 +556,31 @@ uint32_t galvoParser_scan(DAC8562 &dac, bool timerFault, uint32_t coalescedTicks
         portENTER_CRITICAL(&stateLock);
         const uint64_t after = nowUs();
         writingDac = false;
-        if (DiagnosticMode && epoch == generation)
+        const uint32_t gapLimit = scanGapLimitUs();
+        if (epoch == generation)
         {
             ++metrics.points;
             metrics.maxDacUs = std::max(metrics.maxDacUs, uint32_t(after - at));
-            metrics.slowDac += after - at > scanGapLimitUs();
+            metrics.slowDac += after - at > gapLimit;
             if (active)
                 metrics.maxGapUs = std::max(metrics.maxGapUs, uint32_t(after - lastScan));
         }
-        if (epoch == generation && after - at > scanGapLimitUs())
+        if (epoch == generation && after - at > gapLimit)
             latchScanFault(DacUpdateGap);
-        else if (epoch == generation && active && after - lastScan > scanGapLimitUs())
+        else if (epoch == generation && active && after - lastScan > gapLimit)
             latchScanFault(BeforeDacGap);
         const bool valid = epoch == generation;
         if (valid)
             lastScan = after;
         if (valid && point.frame)
         {
+            ++metrics.started;
+            if (active)
+                metrics.maxStartGapUs = std::max(metrics.maxStartGapUs, uint32_t(at - activeAt));
             active = point.frame;
             activeAt = at;
         }
-        checkLight(after);
-        setOutput(valid && !point.blank && !flags(after));
+        setOutput(valid && !point.blank && !DiagnosticMode && !scanBlocked());
         portEXIT_CRITICAL(&stateLock);
         if (valid && point.frame && starts)
         {
